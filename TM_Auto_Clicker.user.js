@@ -7,6 +7,8 @@
 // @match        https://x.com/*
 // @run-at       document-idle
 // @grant        none
+// @updateURL    https://raw.githubusercontent.com/myhomeayu/tamper-scripts/main/TM_Auto_Clicker.user.js
+// @downloadURL  https://raw.githubusercontent.com/myhomeayu/tamper-scripts/main/TM_Auto_Clicker.user.js
 // ==/UserScript==
 
 (() => {
