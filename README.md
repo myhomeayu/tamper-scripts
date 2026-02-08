@@ -1,1 +1,1 @@
-# tamper-scripts
+# TM_Auto_Clicker
