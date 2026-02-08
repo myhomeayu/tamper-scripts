@@ -8,8 +8,8 @@
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
-// @updateURL    https://github.com/myhomeayu/X_Auto_Follow_ReLogin/blob/main/TM_Auto_Clicker.user.js
-// @downloadURL  https://github.com/myhomeayu/X_Auto_Follow_ReLogin/blob/main/TM_Auto_Clicker.user.js
+// @updateURL    https://github.com/myhomeayu/tamper-scripts/blob/main/TM_Auto_Clicker.user.js
+// @downloadURL  https://github.com/myhomeayu/tamper-scripts/blob/main/TM_Auto_Clicker.user.js
 
 (() => {
   'use strict';
