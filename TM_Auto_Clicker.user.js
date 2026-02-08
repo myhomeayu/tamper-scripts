@@ -7,9 +7,9 @@
 // @match        https://x.com/*
 // @run-at       document-idle
 // @grant        none
+// ==/UserScript==
 // @updateURL    https://raw.githubusercontent.com/myhomeayu/tamper-scripts/main/TM_Auto_Clicker.user.js
 // @downloadURL  https://raw.githubusercontent.com/myhomeayu/tamper-scripts/main/TM_Auto_Clicker.user.js
-// ==/UserScript==
 
 (() => {
   'use strict';
@@ -25,6 +25,8 @@
   const GCP_DELAY_MIN_MS = 9500;
   const GCP_DELAY_MAX_MS = 12000;
   const GCP_GUARD_PREFIX = 'tm_autoclick_gcp:';
+  const GCP_RESULT_GUARD_PREFIX = 'tm_autoclick_gcp_result:';
+  const GCP_RESULT_DELAY_MS = 1000;
 
   // X OAuth
   const X_DELAY_MIN_MS = 1800;
@@ -137,6 +139,104 @@
         issues.push('no_href');
       }
     }
+
+      // ==============================
+      // Phase: GCP Result (「結果をみる」)
+      // ==============================
+      function runGcpResultPhase() {
+        const label = 'GCP_RESULT';
+        state.phase = `${label}:init`;
+
+        const guardKey = getGuardKey(GCP_RESULT_GUARD_PREFIX);
+
+        const findFn = () => {
+          const elements = document.querySelectorAll('a');
+          state.lastCandidateCount = elements.length;
+          const list = Array.from(elements || []);
+
+          const textMatch = (el) => normalizeText(el.innerText || el.textContent || '').includes('結果をみる');
+          const hrefMatch = (el) => (el.getAttribute('href') || '').includes('/entry/lottery/result');
+
+          // Priority: both text + href, then href, then text
+          let candidates = list.filter((el) => textMatch(el) && hrefMatch(el));
+          if (candidates.length === 0) candidates = list.filter((el) => hrefMatch(el));
+          if (candidates.length === 0) candidates = list.filter((el) => textMatch(el));
+
+          if (candidates.length === 0) {
+            if (DEBUG) {
+              dumpCandidates(label, list, MAX_DUMP_CANDIDATES, (el) => {
+                const issues = getElementIssues(el, { textMatchers: ['結果をみる'] });
+                return elementInfo(el, issues);
+              });
+            } else {
+              info(`${label}: no target found.`);
+            }
+            return null;
+          }
+
+          // If multiple, prefer hrefs containing 'result' or 'lottery'
+          candidates.sort((a, b) => {
+            const aScore = ((a.getAttribute('href') || '').includes('result') || (a.getAttribute('href') || '').includes('lottery')) ? 0 : 1;
+            const bScore = ((b.getAttribute('href') || '').includes('result') || (b.getAttribute('href') || '').includes('lottery')) ? 0 : 1;
+            return aScore - bScore;
+          });
+
+          // Ensure element is actionable (visible & not disabled)
+          for (const el of candidates) {
+            const issues = getElementIssues(el, { textMatchers: ['結果をみる'] });
+            if (issues.length === 0) return el;
+          }
+
+          return null;
+        };
+
+        const scheduleFixed = () => {
+          if (sessionStorage.getItem(guardKey)) {
+            log(`${label}: guard skip`);
+            return;
+          }
+
+          const found = findFn();
+          if (!found) {
+            info(`${label}: not found at scheduling time`);
+            return;
+          }
+
+          log(`${label}: found. delay=${GCP_RESULT_DELAY_MS}ms`);
+
+          setTimeout(() => {
+            state.phase = `${label}:recheck`;
+            const el = findFn();
+            if (!el) {
+              info(`${label}: target disappeared before click.`);
+              return;
+            }
+
+            // set guard before clicking to avoid races
+            sessionStorage.setItem(guardKey, Date.now().toString());
+            state.phase = `${label}:click`;
+            clickWithFallback(el).then((ok) => {
+              info(`${label}: clicked. success=${ok}`);
+              state.phase = `${label}:done`;
+            });
+          }, GCP_RESULT_DELAY_MS);
+        };
+
+        const initial = findFn();
+        if (initial) {
+          scheduleFixed();
+          return;
+        }
+
+        startObserver({
+          label,
+          findFn,
+          timeoutMs: OBSERVER_TIMEOUT_MS,
+          onFound: () => {
+            scheduleFixed();
+          }
+        });
+      }
 
     return issues;
   }
@@ -463,6 +563,7 @@
 
       if (host === 'gcp.giftee.biz') {
         runGcpPhase();
+        runGcpResultPhase();
         return;
       }
 
