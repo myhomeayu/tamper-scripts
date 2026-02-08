@@ -27,6 +27,13 @@
   const GCP_GUARD_PREFIX = 'tm_autoclick_gcp:';
   const GCP_RESULT_GUARD_PREFIX = 'tm_autoclick_gcp_result:';
   const GCP_RESULT_DELAY_MS = 1000;
+  // GCP join retry/cooldown
+  const GCP_JOIN_KEY_PREFIX = 'tm_autoclick_gcp_join:';
+  const GCP_JOIN_DELAY_MS = 1000; // fixed 1s
+  const GCP_JOIN_RETRY_COOLDOWN_MS = 7000; // 7s cooldown
+  const GCP_JOIN_MAX_CLICKS_PER_PAGE = 5;
+  // X fixed delay
+  const X_FIXED_DELAY_MS = 1000;
 
   // X OAuth
   const X_DELAY_MIN_MS = 1800;
@@ -57,6 +64,9 @@
     observerActive: false,
     lastError: null
   };
+
+  // In-memory retry timers for GCP join per-URL to avoid duplicate scheduling
+  const gcpJoinRetryTimers = new Map();
 
   // ==============================
   // Logging
@@ -95,6 +105,18 @@
 
   function normalizeText(str) {
     return (str || '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Detect presence of GCP join wait/error messages that require longer wait
+  function detectGcpJoinWaitMessage() {
+    try {
+      const body = document.body && (document.body.innerText || '');
+      if (!body) return false;
+      const s = normalizeText(body);
+      return s.includes('参加条件の達成が確認できませんでした') || s.includes('10秒ほどお待ちいただいてから参加ボタンを押してください');
+    } catch (e) {
+      return false;
+    }
   }
 
   // Return array of issues. Empty => ok
@@ -139,117 +161,7 @@
         issues.push('no_href');
       }
     }
-
-      // ==============================
-      // Phase: GCP Result (「結果をみる」)
-      // ==============================
-      function runGcpResultPhase() {
-        const label = 'GCP_RESULT';
-        state.phase = `${label}:init`;
-
-        const guardKey = getGuardKey(GCP_RESULT_GUARD_PREFIX);
-
-        const findFn = () => {
-          const elements = document.querySelectorAll('a');
-          state.lastCandidateCount = elements.length;
-          const list = Array.from(elements || []);
-
-          const textMatch = (el) => normalizeText(el.innerText || el.textContent || '').includes('結果をみる');
-          const hrefMatch = (el) => (el.getAttribute('href') || '').includes('/entry/lottery/result');
-
-          // Priority: both text + href, then href, then text
-          let candidates = list.filter((el) => textMatch(el) && hrefMatch(el));
-          if (candidates.length === 0) candidates = list.filter((el) => hrefMatch(el));
-          if (candidates.length === 0) candidates = list.filter((el) => textMatch(el));
-
-          if (candidates.length === 0) {
-            if (DEBUG) {
-              dumpCandidates(label, list, MAX_DUMP_CANDIDATES, (el) => {
-                const issues = getElementIssues(el, { textMatchers: ['結果をみる'] });
-                return elementInfo(el, issues);
-              });
-            } else {
-              info(`${label}: no target found.`);
-            }
-            return null;
-          }
-
-          // If multiple, prefer hrefs containing 'result' or 'lottery'
-          candidates.sort((a, b) => {
-            const aHref = (a.getAttribute('href') || '').toLowerCase();
-            const bHref = (b.getAttribute('href') || '').toLowerCase();
-            const aScore = (aHref.includes('result') || aHref.includes('lottery')) ? 0 : 1;
-            const bScore = (bHref.includes('result') || bHref.includes('lottery')) ? 0 : 1;
-            return aScore - bScore;
-          });
-
-          // Ensure element is actionable (visible & not disabled).
-          // Use appropriate validation depending on how the candidate matched (text/href/both).
-          for (const el of candidates) {
-            const isText = textMatch(el);
-            const isHref = hrefMatch(el);
-            const checkOpts = {};
-            if (isText) checkOpts.textMatchers = ['結果をみる'];
-            if (isHref) checkOpts.requireHrefIncludes = '/entry/lottery/result';
-
-            const issues = getElementIssues(el, checkOpts);
-            if (issues.length === 0) return el;
-            if (DEBUG) {
-              log(`${label}: candidate skipped`, elementInfo(el, issues));
-            }
-          }
-
-          return null;
-        };
-
-        const scheduleFixed = () => {
-          if (sessionStorage.getItem(guardKey)) {
-            log(`${label}: guard skip`);
-            return;
-          }
-
-          const found = findFn();
-          if (!found) {
-            info(`${label}: not found at scheduling time`);
-            return;
-          }
-
-          log(`${label}: found. delay=${GCP_RESULT_DELAY_MS}ms`);
-
-          setTimeout(() => {
-            state.phase = `${label}:recheck`;
-            const el = findFn();
-            if (!el) {
-              info(`${label}: target disappeared before click.`);
-              return;
-            }
-
-            // set guard before clicking to avoid races
-            sessionStorage.setItem(guardKey, Date.now().toString());
-            state.phase = `${label}:click`;
-            clickWithFallback(el).then((ok) => {
-              info(`${label}: clicked. success=${ok}`);
-              state.phase = `${label}:done`;
-            });
-          }, GCP_RESULT_DELAY_MS);
-        };
-
-        const initial = findFn();
-        if (initial) {
-          scheduleFixed();
-          return;
-        }
-
-        startObserver({
-          label,
-          findFn,
-          timeoutMs: OBSERVER_TIMEOUT_MS,
-          onFound: () => {
-            scheduleFixed();
-          }
-        });
-      }
-
+    
     return issues;
   }
 
@@ -366,12 +278,141 @@
     });
   }
 
+  // Fixed-delay scheduler (no randomness)
+  function scheduleAutoClickFixed({ label, findFn, delayMs, guardKey }) {
+    if (state.attempts >= MAX_ATTEMPTS_PER_PAGE) {
+      warn(`${label}: max attempts reached (${MAX_ATTEMPTS_PER_PAGE}). Abort.`);
+      return;
+    }
+
+    state.attempts += 1;
+    state.phase = `${label}:scheduled`;
+    state.guardKey = guardKey;
+
+    if (sessionStorage.getItem(guardKey)) {
+      info(`${label}: already guarded. skip.`);
+      return;
+    }
+
+    log(`${label}: scheduling fixed click after ${delayMs}ms`);
+    setTimeout(() => {
+      state.phase = `${label}:recheck`;
+      const el = findFn();
+
+      if (!el) {
+        info(`${label}: target not found after delay.`);
+        return;
+      }
+
+      sessionStorage.setItem(guardKey, Date.now().toString());
+      state.phase = `${label}:click`;
+      clickWithFallback(el).then((ok) => {
+        info(`${label}: click attempted. success=${ok}`);
+        state.phase = `${label}:done`;
+      });
+    }, delayMs);
+  }
+
+  // GCP join scheduler with cooldown and per-URL click count
+  function scheduleGcpJoinWithCooldown({ label, findFn, delayMs, keyPrefix }) {
+    const metaKey = `${keyPrefix}${location.pathname}${location.search}`;
+
+    const loadMeta = () => {
+      try {
+        const raw = sessionStorage.getItem(metaKey);
+        return raw ? JSON.parse(raw) : { lastClickTs: 0, clickCount: 0 };
+      } catch (e) {
+        return { lastClickTs: 0, clickCount: 0 };
+      }
+    };
+
+    const saveMeta = (m) => {
+      try {
+        sessionStorage.setItem(metaKey, JSON.stringify(m));
+      } catch (e) {
+        // ignore
+      }
+    };
+
+    const meta = loadMeta();
+    if (meta.clickCount >= GCP_JOIN_MAX_CLICKS_PER_PAGE) {
+      info(`${label}: max clicks reached for this URL (${meta.clickCount}). skip.`);
+      return;
+    }
+
+    const since = Date.now() - (meta.lastClickTs || 0);
+    // extend cooldown when specific wait/error messages are present
+    const hasWaitMsg = detectGcpJoinWaitMessage();
+    const effectiveCooldown = hasWaitMsg ? Math.max(GCP_JOIN_RETRY_COOLDOWN_MS, 10000) : GCP_JOIN_RETRY_COOLDOWN_MS;
+    if (since < effectiveCooldown) {
+      const remain = effectiveCooldown - since;
+      // avoid scheduling duplicate retry timers for same URL
+      if (gcpJoinRetryTimers.has(metaKey)) {
+        info(`${label}: in cooldown, remain=${remain}ms (retry already scheduled)`);
+        return;
+      }
+      info(`${label}: in cooldown, remain=${remain}ms; scheduling retry`);
+      const to = setTimeout(() => {
+        try { gcpJoinRetryTimers.delete(metaKey); } catch (e) {}
+        scheduleGcpJoinWithCooldown({ label, findFn, delayMs, keyPrefix });
+      }, remain + 50);
+      gcpJoinRetryTimers.set(metaKey, to);
+      return;
+    }
+
+    const foundNow = findFn();
+    if (!foundNow) {
+      info(`${label}: not found at scheduling time`);
+      return;
+    }
+
+    log(`${label}: found. fixed delay=${delayMs}ms`);
+    setTimeout(() => {
+      state.phase = `${label}:recheck`;
+      const el = findFn();
+      if (!el) {
+        info(`${label}: target disappeared before click.`);
+        return;
+      }
+
+      // reload meta just before clicking to avoid race
+      const meta2 = loadMeta();
+      if (meta2.clickCount >= GCP_JOIN_MAX_CLICKS_PER_PAGE) {
+        info(`${label}: max clicks reached before click (${meta2.clickCount}). skip.`);
+        return;
+      }
+      const since2 = Date.now() - (meta2.lastClickTs || 0);
+      if (since2 < GCP_JOIN_RETRY_COOLDOWN_MS) {
+        info(`${label}: still in cooldown before click. skip.`);
+        return;
+      }
+
+      // clear any pending retry timer for this URL
+      if (gcpJoinRetryTimers.has(metaKey)) {
+        try { clearTimeout(gcpJoinRetryTimers.get(metaKey)); } catch (e) {}
+        try { gcpJoinRetryTimers.delete(metaKey); } catch (e) {}
+      }
+
+      // set metadata BEFORE clicking
+      meta2.lastClickTs = Date.now();
+      meta2.clickCount = (meta2.clickCount || 0) + 1;
+      saveMeta(meta2);
+
+      state.phase = `${label}:click`;
+      clickWithFallback(el).then((ok) => {
+        info(`${label}: clicked. success=${ok}, clickCount=${meta2.clickCount}`);
+        state.phase = `${label}:done`;
+      });
+    }, delayMs);
+  }
+
   function startObserver({ label, findFn, onFound, timeoutMs }) {
+    let active = true;
     const obs = new MutationObserver(() => {
       const el = findFn();
       if (el) {
         obs.disconnect();
-        state.observerActive = false;
+        active = false;
         log(`${label}: observer found target. disconnected.`);
         onFound(el);
       }
@@ -382,15 +423,121 @@
       subtree: true
     });
 
-    state.observerActive = true;
-
     setTimeout(() => {
-      if (state.observerActive) {
+      if (active) {
         obs.disconnect();
-        state.observerActive = false;
+        active = false;
         info(`${label}: observer timeout. disconnected.`);
       }
     }, timeoutMs);
+  }
+
+  // ==============================
+  // Phase: GCP Result (「結果をみる」)
+  // ==============================
+  function runGcpResultPhase() {
+    const label = 'GCP_RESULT';
+    state.phase = `${label}:init`;
+
+    const guardKey = getGuardKey(GCP_RESULT_GUARD_PREFIX);
+
+    const findFn = () => {
+      const elements = document.querySelectorAll('a');
+      state.lastCandidateCount = elements.length;
+      const list = Array.from(elements || []);
+
+      const textMatch = (el) => normalizeText(el.innerText || el.textContent || '').includes('結果をみる');
+      const hrefMatch = (el) => (el.getAttribute('href') || '').includes('/entry/lottery/result');
+
+      // Priority: both text + href, then href, then text
+      let candidates = list.filter((el) => textMatch(el) && hrefMatch(el));
+      if (candidates.length === 0) candidates = list.filter((el) => hrefMatch(el));
+      if (candidates.length === 0) candidates = list.filter((el) => textMatch(el));
+
+      if (candidates.length === 0) {
+        if (DEBUG) {
+          dumpCandidates(label, list, MAX_DUMP_CANDIDATES, (el) => {
+            const issues = getElementIssues(el, { textMatchers: ['結果をみる'] });
+            return elementInfo(el, issues);
+          });
+        } else {
+          info(`${label}: no target found.`);
+        }
+        return null;
+      }
+
+      // If multiple, prefer hrefs containing 'result' or 'lottery'
+      candidates.sort((a, b) => {
+        const aHref = (a.getAttribute('href') || '').toLowerCase();
+        const bHref = (b.getAttribute('href') || '').toLowerCase();
+        const aScore = (aHref.includes('result') || aHref.includes('lottery')) ? 0 : 1;
+        const bScore = (bHref.includes('result') || bHref.includes('lottery')) ? 0 : 1;
+        return aScore - bScore;
+      });
+
+      for (const el of candidates) {
+        const isText = textMatch(el);
+        const isHref = hrefMatch(el);
+        const checkOpts = {};
+        if (isText) checkOpts.textMatchers = ['結果をみる'];
+        if (isHref) checkOpts.requireHrefIncludes = '/entry/lottery/result';
+
+        const issues = getElementIssues(el, checkOpts);
+        if (issues.length === 0) return el;
+        if (DEBUG) {
+          log(`${label}: candidate skipped`, elementInfo(el, issues));
+        }
+      }
+
+      return null;
+    };
+
+    const scheduleFixed = () => {
+      if (sessionStorage.getItem(guardKey)) {
+        log(`${label}: guard skip`);
+        return;
+      }
+
+      const found = findFn();
+      if (!found) {
+        info(`${label}: not found at scheduling time`);
+        return;
+      }
+
+      log(`${label}: found. delay=${GCP_RESULT_DELAY_MS}ms`);
+
+      setTimeout(() => {
+        state.phase = `${label}:recheck`;
+        const el = findFn();
+        if (!el) {
+          info(`${label}: target disappeared before click.`);
+          return;
+        }
+
+        // set guard before clicking to avoid races
+        sessionStorage.setItem(guardKey, Date.now().toString());
+        state.phase = `${label}:click`;
+        clickWithFallback(el).then((ok) => {
+          info(`${label}: clicked. success=${ok}`);
+          state.phase = `${label}:done`;
+        });
+      }, GCP_RESULT_DELAY_MS);
+    };
+
+    const initial = findFn();
+    if (initial) {
+      scheduleFixed();
+      return;
+    }
+
+    startObserver({
+      label,
+      findFn,
+      timeoutMs: OBSERVER_TIMEOUT_MS,
+      onFound: () => {
+        scheduleFixed();
+      }
+    });
   }
 
   // ==============================
@@ -432,12 +579,12 @@
 
     const found = findFn();
     if (found) {
-      scheduleAutoClick({
+      // Use cooldown-aware scheduler for GCP "参加する"
+      scheduleGcpJoinWithCooldown({
         label,
         findFn,
-        delayMin: GCP_DELAY_MIN_MS,
-        delayMax: GCP_DELAY_MAX_MS,
-        guardKey
+        delayMs: GCP_JOIN_DELAY_MS,
+        keyPrefix: GCP_JOIN_KEY_PREFIX
       });
       return;
     }
@@ -447,12 +594,11 @@
       findFn,
       timeoutMs: OBSERVER_TIMEOUT_MS,
       onFound: () => {
-        scheduleAutoClick({
+        scheduleGcpJoinWithCooldown({
           label,
           findFn,
-          delayMin: GCP_DELAY_MIN_MS,
-          delayMax: GCP_DELAY_MAX_MS,
-          guardKey
+          delayMs: GCP_JOIN_DELAY_MS,
+          keyPrefix: GCP_JOIN_KEY_PREFIX
         });
       }
     });
@@ -499,11 +645,10 @@
 
     const found = findFn();
     if (found) {
-      scheduleAutoClick({
+      scheduleAutoClickFixed({
         label,
         findFn,
-        delayMin: X_DELAY_MIN_MS,
-        delayMax: X_DELAY_MAX_MS,
+        delayMs: X_FIXED_DELAY_MS,
         guardKey
       });
       return;
@@ -514,11 +659,10 @@
       findFn,
       timeoutMs: OBSERVER_TIMEOUT_MS,
       onFound: () => {
-        scheduleAutoClick({
+        scheduleAutoClickFixed({
           label,
           findFn,
-          delayMin: X_DELAY_MIN_MS,
-          delayMax: X_DELAY_MAX_MS,
+          delayMs: X_FIXED_DELAY_MS,
           guardKey
         });
       }
