@@ -176,15 +176,27 @@
 
           // If multiple, prefer hrefs containing 'result' or 'lottery'
           candidates.sort((a, b) => {
-            const aScore = ((a.getAttribute('href') || '').includes('result') || (a.getAttribute('href') || '').includes('lottery')) ? 0 : 1;
-            const bScore = ((b.getAttribute('href') || '').includes('result') || (b.getAttribute('href') || '').includes('lottery')) ? 0 : 1;
+            const aHref = (a.getAttribute('href') || '').toLowerCase();
+            const bHref = (b.getAttribute('href') || '').toLowerCase();
+            const aScore = (aHref.includes('result') || aHref.includes('lottery')) ? 0 : 1;
+            const bScore = (bHref.includes('result') || bHref.includes('lottery')) ? 0 : 1;
             return aScore - bScore;
           });
 
-          // Ensure element is actionable (visible & not disabled)
+          // Ensure element is actionable (visible & not disabled).
+          // Use appropriate validation depending on how the candidate matched (text/href/both).
           for (const el of candidates) {
-            const issues = getElementIssues(el, { textMatchers: ['結果をみる'] });
+            const isText = textMatch(el);
+            const isHref = hrefMatch(el);
+            const checkOpts = {};
+            if (isText) checkOpts.textMatchers = ['結果をみる'];
+            if (isHref) checkOpts.requireHrefIncludes = '/entry/lottery/result';
+
+            const issues = getElementIssues(el, checkOpts);
             if (issues.length === 0) return el;
+            if (DEBUG) {
+              log(`${label}: candidate skipped`, elementInfo(el, issues));
+            }
           }
 
           return null;
